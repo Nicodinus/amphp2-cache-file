@@ -1,0 +1,40 @@
+{
+  "name": "nicodinus/amphp2-cache-file",
+  "homepage": "https://github.com/nicodinus/amphp2-cache-file",
+  "description": "A file adapter for nicodinus/amphp2-cache package.",
+  "license": "MIT",
+  "support": {
+	"issues": "https://github.com/nicodinus/amphp2-cache-file/issues"
+  },
+  "authors": [
+	{
+	  "name": "Aleksei Iarovoi",
+	  "email": "nicodinus@yandex.ru"
+	}
+  ],
+  "require": {
+	"php": ">=7.4",
+    "amphp/sync": "^1.4",
+    "amphp/file": "^2",
+    "nicodinus/amphp2-cache": "dev-master"
+  },
+  "require-dev": {
+	"amphp/phpunit-util": "^1.1",
+	"phpunit/phpunit": "^9",
+	"amphp/php-cs-fixer-config": "dev-master",
+	"vimeo/psalm": "^4"
+  },
+  "autoload": {
+	"psr-4": {
+	  "Amp\\Cache\\": "lib"
+	}
+  },
+  "autoload-dev": {
+	"psr-4": {
+	  "Amp\\Cache\\Test\\": "test"
+	}
+  },
+  "conflict": {
+	"amphp/file": "<0.2 || >=3"
+  }
+}
