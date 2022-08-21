@@ -1,10 +1,8 @@
 <?php
-/** @noinspection PhpUndefinedFunctionInspection */
 
 namespace Amp\Cache;
 
 use Amp\File;
-use Amp\File\Driver;
 use Amp\Loop;
 use Amp\Promise;
 use Amp\Sync\KeyedMutex;
@@ -31,14 +29,6 @@ class FileCache implements Cache
     {
         $this->directory = \rtrim($directory, "/\\");
         $this->mutex = $mutex;
-
-        if (!\interface_exists(Driver::class)) {
-            throw new \Error(__CLASS__ . ' requires amphp/file to be installed');
-        }
-
-        if (!\function_exists('Amp\File\listFiles')) {
-            throw new \Error(__CLASS__ . ' supports only amphp/file:^2 version');
-        }
 
         $gcWatcher = \Closure::fromCallable([$this, '_watchExpiredCache']);
 
