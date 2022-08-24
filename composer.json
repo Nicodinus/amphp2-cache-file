@@ -19,10 +19,10 @@
     "nicodinus/amphp2-cache": "dev-master"
   },
   "require-dev": {
-	"amphp/phpunit-util": "^1.1",
-	"phpunit/phpunit": "^9",
-	"amphp/php-cs-fixer-config": "dev-master",
-	"vimeo/psalm": "^4"
+    "amphp/phpunit-util": "^2",
+    "phpunit/phpunit": "^9.5",
+    "nicodinus/php-cs-fixer-config": "dev-master",
+    "vimeo/psalm": "^4.26"
   },
   "autoload": {
 	"psr-4": {
@@ -35,6 +35,6 @@
 	}
   },
   "conflict": {
-	"amphp/file": "<0.2 || >=3"
+	"amphp/file": "<2 || >=3"
   }
 }

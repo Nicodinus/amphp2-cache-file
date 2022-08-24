@@ -3,7 +3,6 @@
         errorLevel="2"
         phpVersion="7.4"
         reportMixedIssues="false"
-        resolveFromConfigFile="true"
         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xmlns="https://getpsalm.org/schema/config"
         xsi:schemaLocation="https://getpsalm.org/schema/config vendor/vimeo/psalm/config.xsd"
@@ -14,30 +13,4 @@
             <directory name="vendor"/>
         </ignoreFiles>
     </projectFiles>
-
-    <issueHandlers>
-        <StringIncrement>
-            <errorLevel type="suppress">
-                <directory name="lib"/>
-            </errorLevel>
-        </StringIncrement>
-
-        <RedundantConditionGivenDocblockType>
-            <errorLevel type="suppress">
-                <directory name="lib"/>
-            </errorLevel>
-        </RedundantConditionGivenDocblockType>
-
-        <DocblockTypeContradiction>
-            <errorLevel type="suppress">
-                <directory name="lib"/>
-            </errorLevel>
-        </DocblockTypeContradiction>
-
-        <MissingClosureParamType>
-            <errorLevel type="suppress">
-                <directory name="lib"/>
-            </errorLevel>
-        </MissingClosureParamType>
-    </issueHandlers>
 </psalm>

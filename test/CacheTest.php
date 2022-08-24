@@ -3,8 +3,8 @@
 namespace Amp\Cache\Test;
 
 use Amp\Cache\Cache;
-use Amp\Delayed;
 use Amp\PHPUnit\AsyncTestCase;
+use function Amp\delay;
 
 abstract class CacheTest extends AsyncTestCase
 {
@@ -14,13 +14,12 @@ abstract class CacheTest extends AsyncTestCase
     {
         $cache = $this->createCache();
 
-        $result = yield $cache->get("mykey");
-        $this->assertNull($result);
+        $this->assertNull(yield $cache->get("mykey"));
 
         yield $cache->set("mykey", "myvalue", 10);
+        $this->assertSame("myvalue", yield $cache->get("mykey"));
 
-        $result = yield $cache->get("mykey");
-        $this->assertSame("myvalue", $result);
+        yield $cache->delete("mykey");
     }
 
     public function testEntryIsNotReturnedAfterTTLHasPassed(): \Generator
@@ -28,8 +27,7 @@ abstract class CacheTest extends AsyncTestCase
         $cache = $this->createCache();
 
         yield $cache->set("foo", "bar", 0);
-        yield new Delayed(1000);
-
+        yield delay(10);
         $this->assertNull(yield $cache->get("foo"));
     }
 
@@ -39,7 +37,6 @@ abstract class CacheTest extends AsyncTestCase
 
         yield $cache->set("foo", "bar", 0);
         yield $cache->set("foo", "bar");
-        yield new Delayed(1000);
 
         $this->assertNotNull(yield $cache->get("foo"));
     }

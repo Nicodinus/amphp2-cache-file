@@ -2,6 +2,8 @@
 
 namespace Amp\Cache;
 
+use Amp\ByteStream;
+use Amp\Failure;
 use Amp\File;
 use Amp\Loop;
 use Amp\Promise;
@@ -12,6 +14,12 @@ use function Amp\call;
 
 class FileCache implements Cache
 {
+    const TTL_TYPE_NONE = 0x00;
+    const TTL_TYPE_UINT8_ME = 0x01;
+    const TTL_TYPE_UINT16_ME = 0x02;
+    const TTL_TYPE_UINT32_ME = 0x03;
+    const TTL_TYPE_UINT64_ME = 0x04;
+
     /** @var string */
     private string $directory;
 
@@ -30,7 +38,7 @@ class FileCache implements Cache
         $this->directory = \rtrim($directory, "/\\");
         $this->mutex = $mutex;
 
-        $gcWatcher = \Closure::fromCallable([$this, '_watchExpiredCache']);
+        $gcWatcher = \Closure::fromCallable([$this, '_gcWatcherCallback']);
 
         // trigger once, so short running scripts also GC and don't grow forever
         Loop::defer($gcWatcher);
@@ -48,6 +56,9 @@ class FileCache implements Cache
             Loop::cancel($this->gcWatcher);
             $this->gcWatcher = null;
         }
+
+        $gcWatcher = \Closure::fromCallable([$this, '_gcWatcherCallback']);
+        Loop::defer($gcWatcher);
     }
 
     /**
@@ -63,9 +74,17 @@ class FileCache implements Cache
     }
 
     /**
+     * @return string|null
+     */
+    protected function getFileSignature(): ?string
+    {
+        return 'amp2-cache-file';
+    }
+
+    /**
      * @return \Generator
      */
-    protected function _watchExpiredCache(): \Generator
+    protected function _gcWatcherCallback(): \Generator
     {
         try {
             $files = yield File\listFiles($this->directory);
@@ -75,25 +94,21 @@ class FileCache implements Cache
                     continue;
                 }
 
+                $path = $this->directory . DIRECTORY_SEPARATOR . $file;
+
                 /** @var Lock $lock */
                 $lock = yield $this->getMutex()->acquire($file);
-                \assert($lock instanceof Lock);
 
                 try {
-                    /** @var File\File $handle */
-                    $handle = yield File\openFile($this->directory . '/' . $file, 'r');
-                    $ttl = yield $handle->read(4);
-
-                    if ($ttl === null || \strlen($ttl) !== 4) {
-                        yield $handle->close();
+                    /** @var File\File|null $fh */
+                    $fh = yield $this->openCacheFileAtPath($path);
+                    if (!$fh) {
                         continue;
                     }
-
-                    $ttl = \unpack('Nttl', $ttl)['ttl'];
-                    if ($ttl < \time()) {
-                        yield File\deleteFile($this->directory . '/' . $file);
-                    }
                 } catch (\Throwable $e) {
+                    if (true === yield File\isFile($path)) {
+                        yield File\deleteFile($path);
+                    }
                     // ignore
                 } finally {
                     $lock->release();
@@ -116,35 +131,125 @@ class FileCache implements Cache
         return $this->mutex;
     }
 
+    /**
+     * Returns Amp\File\File when cache file is valid and not expired. Deletes only if cache is expired.
+     *
+     * @param string $path
+     *
+     * @return Promise<File\File|null>|Failure<CacheException>
+     */
+    protected function openCacheFileAtPath(string $path): Promise
+    {
+        return call(function () use (&$path) {
+            /** @var File\File $fh */
+            $fh = yield File\openFile($path, 'rb');
+
+            if ($fh->eof()) {
+                yield $fh->close();
+                throw new CacheException("Invalid cache file (empty) at `{$path}`");
+            }
+
+            $checkSignature = $this->getFileSignature();
+            $checkSignatureLength = $checkSignature !== null ? \strlen($checkSignature) : 0;
+            if ($checkSignatureLength > 0) {
+                $signature = yield $fh->read($checkSignatureLength);
+                if ($signature === null || $signature !== $checkSignature) {
+                    yield $fh->close();
+                    throw new CacheException("Invalid cache file (signature mismatch) at `{$path}`");
+                }
+            }
+
+            $expiredAtType = yield $fh->read(1);
+            if ($expiredAtType === null) {
+                yield $fh->close();
+                throw new CacheException("Invalid cache file (expired_at_type empty) at `{$path}`");
+            }
+            $expiredAtType = \unpack('C', $expiredAtType)[1];
+
+            if ($expiredAtType === self::TTL_TYPE_NONE) {
+                return $fh;
+            }
+
+            switch ($expiredAtType) {
+                case self::TTL_TYPE_UINT8_ME:
+                    $expiredAt = yield $fh->read(1);
+                    if ($expiredAt === null) {
+                        yield $fh->close();
+                        throw new CacheException("Invalid cache file (expired_at empty) at `{$path}`");
+                    }
+                    $expiredAt = \unpack('C', $expiredAt)[1];
+                    break;
+                case self::TTL_TYPE_UINT16_ME:
+                    $expiredAt = yield $fh->read(2);
+                    if ($expiredAt === null) {
+                        yield $fh->close();
+                        throw new CacheException("Invalid cache file (expired_at empty) at `{$path}`");
+                    }
+                    $expiredAt = \unpack('S', $expiredAt)[1];
+                    break;
+                case self::TTL_TYPE_UINT32_ME:
+                    $expiredAt = yield $fh->read(4);
+                    if ($expiredAt === null) {
+                        yield $fh->close();
+                        throw new CacheException("Invalid cache file (expired_at empty) at `{$path}`");
+                    }
+                    $expiredAt = \unpack('L', $expiredAt)[1];
+                    break;
+                case self::TTL_TYPE_UINT64_ME:
+                    $expiredAt = yield $fh->read(8);
+                    if ($expiredAt === null) {
+                        yield $fh->close();
+                        throw new CacheException("Invalid cache file (expired_at empty) at `{$path}`");
+                    }
+                    $expiredAt = \unpack('Q', $expiredAt)[1];
+                    break;
+                default:
+                    yield $fh->close();
+                    throw new CacheException("Invalid expired_at type `{$expiredAtType}` at cache file `{$path}`");
+            }
+
+            if (\hrtime(true) > $expiredAt) {
+                yield $fh->close();
+                yield File\deleteFile($path);
+                return null;
+            }
+
+            return $fh;
+        });
+    }
+
     /** @inheritdoc */
     public function get(string $key): Promise
     {
         return call(function () use ($key) {
             $filename = $this->getFilename($key);
+            $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
+
+            if (false === yield File\isFile($path)) {
+                return null;
+            }
 
             /** @var Lock $lock */
             $lock = yield $this->getMutex()->acquire($filename);
-            \assert($lock instanceof Lock);
 
             try {
-                $cacheContent = yield File\read($this->directory . '/' . $filename);
-
-                if (\strlen($cacheContent) < 4) {
+                /** @var File\File|null $fh */
+                $fh = yield $this->openCacheFileAtPath($path);
+                if (!$fh) {
                     return null;
                 }
 
-                $ttl = \unpack('Nttl', \substr($cacheContent, 0, 4))['ttl'];
-                if ($ttl < \time()) {
-                    yield File\deleteFile($this->directory . '/' . $filename);
+                $buffer = yield ByteStream\buffer($fh);
+                if (\strlen($buffer) < 1) {
+                    yield $fh->close();
+                    yield File\deleteFile($path);
                     return null;
                 }
-
-                $value = \substr($cacheContent, 4);
-
-                \assert(\is_string($value));
-
-                return $value;
-            } catch (\Throwable $e) {
+                return $buffer;
+            } catch (\Throwable $exception) {
+                if (true === yield File\isFile($path)) {
+                    yield File\deleteFile($path);
+                }
                 return null;
             } finally {
                 $lock->release();
@@ -165,21 +270,34 @@ class FileCache implements Cache
 
         return call(function () use ($key, $value, $ttl) {
             $filename = $this->getFilename($key);
+            $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
 
             /** @var Lock $lock */
             $lock = yield $this->getMutex()->acquire($filename);
-            \assert($lock instanceof Lock);
 
             if ($ttl === null) {
-                $ttl = \PHP_INT_MAX;
+                $expiredAt = \pack('C', self::TTL_TYPE_NONE);
             } else {
-                $ttl = \time() + $ttl;
+                $ttl = \hrtime(true) + $ttl * 1e+9;
+                if ($ttl <= 0xFF) {
+                    $expiredAt = \pack('CC', self::TTL_TYPE_UINT8_ME, $ttl);
+                } elseif ($ttl > 0xFF && $ttl <= 0xFFFF) {
+                    $expiredAt = \pack('CS', self::TTL_TYPE_UINT16_ME, $ttl);
+                } elseif ($ttl > 0xFFFF && $ttl <= 0xFFFFFFFF) {
+                    $expiredAt = \pack('CL', self::TTL_TYPE_UINT32_ME, $ttl);
+                } else {
+                    $expiredAt = \pack('CQ', self::TTL_TYPE_UINT64_ME, $ttl);
+                }
             }
 
-            $encodedTtl = \pack('N', $ttl);
+            $checkSignature = $this->getFileSignature();
+            $checkSignatureLength = $checkSignature !== null ? \strlen($checkSignature) : 0;
+            if ($checkSignatureLength > 0) {
+                $expiredAt = $this->getFileSignature() . $expiredAt;
+            }
 
             try {
-                yield File\write($this->directory . '/' . $filename, $encodedTtl . $value);
+                yield File\write($path, $expiredAt . $value);
             } finally {
                 $lock->release();
             }
@@ -191,13 +309,17 @@ class FileCache implements Cache
     {
         return call(function () use ($key) {
             $filename = $this->getFilename($key);
+            $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
+
+            if (false === yield File\isFile($path)) {
+                return null;
+            }
 
             /** @var Lock $lock */
             $lock = yield $this->getMutex()->acquire($filename);
-            \assert($lock instanceof Lock);
 
             try {
-                return yield File\deleteFile($this->directory . '/' . $filename);
+                return yield File\deleteFile($path);
             } finally {
                 $lock->release();
             }
