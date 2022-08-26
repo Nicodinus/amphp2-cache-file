@@ -23,6 +23,9 @@ class FileCache implements Cache
     /** @var string */
     private string $directory;
 
+    /** @var File\Filesystem */
+    private File\Filesystem $filesystem;
+
     /** @var KeyedMutex|null */
     private ?KeyedMutex $mutex;
 
@@ -32,11 +35,13 @@ class FileCache implements Cache
     /**
      * @param string $directory
      * @param KeyedMutex|null $mutex
+     * @param File\Filesystem|null $filesystem
      */
-    public function __construct(string $directory, KeyedMutex $mutex = null)
+    public function __construct(string $directory, KeyedMutex $mutex = null, File\Filesystem $filesystem = null)
     {
         $this->directory = \rtrim($directory, "/\\");
         $this->mutex = $mutex;
+        $this->filesystem = $filesystem ?? File\filesystem();
 
         $gcWatcher = \Closure::fromCallable([$this, '_gcWatcherCallback']);
 
@@ -87,7 +92,7 @@ class FileCache implements Cache
     protected function _gcWatcherCallback(): \Generator
     {
         try {
-            $files = yield File\listFiles($this->directory);
+            $files = yield $this->filesystem->listFiles($this->directory);
 
             foreach ($files as $file) {
                 if (\strlen($file) !== 70 || \substr($file, -\strlen('.cache')) !== '.cache') {
@@ -106,8 +111,8 @@ class FileCache implements Cache
                         continue;
                     }
                 } catch (\Throwable $e) {
-                    if (true === yield File\isFile($path)) {
-                        yield File\deleteFile($path);
+                    if (true === yield $this->filesystem->isFile($path)) {
+                        yield $this->filesystem->deleteFile($path);
                     }
                     // ignore
                 } finally {
@@ -142,7 +147,7 @@ class FileCache implements Cache
     {
         return call(function () use (&$path) {
             /** @var File\File $fh */
-            $fh = yield File\openFile($path, 'rb');
+            $fh = yield $this->filesystem->openFile($path, 'rb');
 
             if ($fh->eof()) {
                 yield $fh->close();
@@ -210,7 +215,7 @@ class FileCache implements Cache
 
             if (\hrtime(true) > $expiredAt) {
                 yield $fh->close();
-                yield File\deleteFile($path);
+                yield $this->filesystem->deleteFile($path);
                 return null;
             }
 
@@ -225,7 +230,7 @@ class FileCache implements Cache
             $filename = $this->getFilename($key);
             $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
 
-            if (false === yield File\isFile($path)) {
+            if (false === yield $this->filesystem->isFile($path)) {
                 return null;
             }
 
@@ -242,13 +247,13 @@ class FileCache implements Cache
                 $buffer = yield ByteStream\buffer($fh);
                 if (\strlen($buffer) < 1) {
                     yield $fh->close();
-                    yield File\deleteFile($path);
+                    yield $this->filesystem->deleteFile($path);
                     return null;
                 }
                 return $buffer;
             } catch (\Throwable $exception) {
-                if (true === yield File\isFile($path)) {
-                    yield File\deleteFile($path);
+                if (true === yield $this->filesystem->isFile($path)) {
+                    yield $this->filesystem->deleteFile($path);
                 }
                 return null;
             } finally {
@@ -262,6 +267,10 @@ class FileCache implements Cache
     {
         if ($value === null) {
             throw new CacheException('Cannot store NULL in ' . self::class);
+        }
+
+        if (!\is_string($value)) {
+            throw new CacheException('Cannot store non-string value in ' . self::class);
         }
 
         if ($ttl < 0) {
@@ -297,7 +306,7 @@ class FileCache implements Cache
             }
 
             try {
-                yield File\write($path, $expiredAt . $value);
+                yield $this->filesystem->write($path, $expiredAt . $value);
             } finally {
                 $lock->release();
             }
@@ -311,7 +320,7 @@ class FileCache implements Cache
             $filename = $this->getFilename($key);
             $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
 
-            if (false === yield File\isFile($path)) {
+            if (false === yield $this->filesystem->isFile($path)) {
                 return null;
             }
 
@@ -319,7 +328,7 @@ class FileCache implements Cache
             $lock = yield $this->getMutex()->acquire($filename);
 
             try {
-                return yield File\deleteFile($path);
+                return yield $this->filesystem->deleteFile($path);
             } finally {
                 $lock->release();
             }

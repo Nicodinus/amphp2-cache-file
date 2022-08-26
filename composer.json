@@ -36,5 +36,16 @@
   },
   "conflict": {
 	"amphp/file": "<2 || >=3"
+  },
+  "scripts": {
+    "check": [
+      "@cs",
+      "@psalm",
+      "@test"
+    ],
+    "cs": "PHP_CS_FIXER_IGNORE_ENV=1 ./vendor/bin/php-cs-fixer --diff --dry-run -v fix",
+    "cs-fix": "PHP_CS_FIXER_IGNORE_ENV=1 ./vendor/bin/php-cs-fixer --diff -v fix",
+    "psalm": "./vendor/bin/psalm",
+    "test": "@php -dzend.assertions=1 -dassert.exception=1 ./vendor/bin/phpunit"
   }
 }
