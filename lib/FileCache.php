@@ -281,6 +281,10 @@ class FileCache implements Cache
             $filename = $this->getFilename($key);
             $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
 
+            if (false === yield $this->filesystem->isDirectory($this->directory)) {
+                yield $this->filesystem->createDirectoryRecursively($this->directory, 0700);
+            }
+
             /** @var Lock $lock */
             $lock = yield $this->getMutex()->acquire($filename);
 
