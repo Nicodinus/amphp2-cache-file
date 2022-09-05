@@ -5,13 +5,13 @@ namespace Amp\Cache\Test;
 use Amp\ByteStream\InMemoryStream;
 use Amp\ByteStream\InputStream;
 use Amp\Cache\Cache;
+use Amp\Cache\CacheItem;
 use Amp\Emitter;
 use Amp\PHPUnit\AsyncTestCase;
 use Amp\Promise;
 use function Amp\asyncCall;
 use function Amp\call;
 use function Amp\delay;
-use function Amp\Iterator\toArray;
 
 abstract class CacheTest extends AsyncTestCase
 {
@@ -59,42 +59,67 @@ abstract class CacheTest extends AsyncTestCase
         yield $cache->delete("mykey");
     }
 
-    public function testGetIterator(): \Generator
+    public function testGetItem(): \Generator
     {
         $cache = $this->createCache();
+        $testKey = \uniqid("key_");
+        $testValue = \uniqid("value_");
 
-        $result = yield toArray($cache->getIterator("mykey"));
-        $this->assertTrue(\sizeof($result) == 0);
-
-        $emitter = new Emitter();
-
-        asyncCall(function () use (&$emitter) {
-            yield $emitter->emit("myvalue");
-            $emitter->complete();
-        });
-
-        yield $cache->setIterator("mykey", $emitter->iterate(), 10);
-
-        $result = yield toArray($cache->getIterator("mykey"));
-        $this->assertTrue(\sizeof($result) == 1);
-        $result = \array_pop($result);
-        $this->assertSame("myvalue", $result);
-
-        yield $cache->delete("mykey");
-    }
-
-    public function testGetStream(): \Generator
-    {
-        $cache = $this->createCache();
-
-        $result = yield $this->buffer($cache->getStream("mykey"));
+        // check simple set
+        yield $cache->delete($testKey);
+        $result = yield $cache->getItem($testKey);
         $this->assertNull($result);
 
-        yield $cache->setStream("mykey", new InMemoryStream("myvalue"), 10);
-        $result = yield $this->buffer($cache->getStream("mykey"));
-        $this->assertSame("myvalue", $result);
+        yield $cache->set($testKey, $testValue, 10);
+        /** @var CacheItem $result */
+        $result = yield $cache->getItem($testKey);
 
-        yield $cache->delete("mykey");
+        $this->assertInstanceOf(CacheItem::class, $result);
+        $this->assertSame($testValue, yield $this->buffer($result->getResult()));
+
+        // check set from iterator
+        yield $cache->delete($testKey);
+        $result = yield $cache->getItem($testKey);
+        $this->assertNull($result);
+
+        $emitter = new Emitter();
+        asyncCall(function () use (&$emitter, &$testValue) {
+            yield $emitter->emit($testValue);
+            $emitter->complete();
+        });
+        yield $cache->set($testKey, $emitter->iterate(), 10);
+        /** @var CacheItem $result */
+        $result = yield $cache->getItem($testKey);
+
+        $this->assertInstanceOf(CacheItem::class, $result);
+        $this->assertFalse($result->isIterable());
+        $this->assertTrue($result->getStream() instanceof InputStream);
+
+        /** @var array $result */
+        $result = yield $this->buffer($result->getStream());
+        $this->assertSame($testValue, $result);
+
+        // check set from stream
+        yield $cache->delete($testKey);
+        $result = yield $cache->getItem($testKey);
+        $this->assertNull($result);
+
+        $stream = new InMemoryStream($testValue);
+        yield $cache->set($testKey, $stream, 10);
+        /** @var CacheItem $result */
+        $result = yield $cache->getItem($testKey);
+
+        $this->assertInstanceOf(CacheItem::class, $result);
+        $this->assertTrue($result->isStream());
+        $this->assertTrue($result->getStream() instanceof InputStream);
+
+        $result = yield $this->buffer($result->getStream());
+        $this->assertSame($testValue, $result);
+
+        // end cleanup
+        yield $cache->delete($testKey);
+        $result = yield $cache->getItem($testKey);
+        $this->assertNull($result);
     }
 
     public function testEntryIsNotReturnedAfterTTLHasPassed(): \Generator

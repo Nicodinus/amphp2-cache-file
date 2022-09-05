@@ -3,8 +3,7 @@
 namespace Amp\Cache;
 
 use Amp\ByteStream\InputStream;
-use Amp\Cache\Internal\PromiseReaderStream;
-use Amp\Emitter;
+use Amp\Coroutine;
 use Amp\Failure;
 use Amp\File;
 use Amp\Iterator;
@@ -13,7 +12,6 @@ use Amp\Promise;
 use Amp\Sync\KeyedMutex;
 use Amp\Sync\LocalKeyedMutex;
 use Amp\Sync\Lock;
-use function Amp\asyncCall;
 use function Amp\call;
 
 class FileCache implements Cache
@@ -127,46 +125,17 @@ class FileCache implements Cache
     /**
      * @inheritDoc
      */
-    public function getIterator(string $key): Iterator
+    public function getItem(string $key): Promise
     {
-        $emitter = new Emitter();
-
-        asyncCall(function () use (&$key, &$emitter) {
-            try {
-                /** @var File\File|null $fh */
-                $fh = yield $this->_get($key);
-                if (!$fh) {
-                    $emitter->complete();
-                    return;
-                }
-
-                while (true) {
-                    $chunk = yield $fh->read();
-                    if ($chunk === null) {
-                        break;
-                    }
-
-                    yield $emitter->emit($chunk);
-                }
-
-                $emitter->complete();
-            } catch (\Throwable $exception) {
-                $emitter->fail($exception);
+        return call(function () use (&$key) {
+            /** @var File\File|null $fh */
+            $fh = yield $this->_get($key);
+            if (!$fh) {
+                return null;
             }
+
+            return new CacheItem($fh);
         });
-
-        return $emitter->iterate();
-    }
-
-    /**
-     * @inheritDoc
-     *
-     * @psalm-suppress InvalidReturnStatement
-     * @psalm-suppress InvalidReturnType
-     */
-    public function getStream(string $key): InputStream
-    {
-        return new PromiseReaderStream($this->_get($key));
     }
 
     /**
@@ -178,58 +147,45 @@ class FileCache implements Cache
             throw new CacheException('Cannot store NULL in ' . self::class);
         }
 
-        if (!\is_string($value)) {
-            throw new CacheException('Cannot store non-string value in ' . self::class);
-        }
-
         return call(function () use (&$key, &$value, &$ttl) {
             /** @var File\File $fh */
             $fh = yield $this->_set($key, $ttl);
 
             try {
-                yield $fh->write($value);
-            } finally {
-                $fh->close();
-            }
-        });
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function setIterator(string $key, Iterator $iterator, int $ttl = null): Promise
-    {
-        return call(function () use (&$key, &$iterator, &$ttl) {
-            /** @var File\File $fh */
-            $fh = yield $this->_set($key, $ttl);
-
-            try {
-                while (true === yield $iterator->advance()) {
-                    yield $fh->write($iterator->getCurrent());
+                if (\is_callable($value)) {
+                    $value = call($value);
+                } elseif ($value instanceof \Generator) {
+                    $value = new Coroutine($value);
                 }
-            } finally {
-                $fh->close();
-            }
-        });
-    }
 
-    /**
-     * @inheritDoc
-     */
-    public function setStream(string $key, InputStream $stream, int $ttl = null): Promise
-    {
-        return call(function () use (&$key, &$stream, &$ttl) {
-            /** @var File\File $fh */
-            $fh = yield $this->_set($key, $ttl);
+                if ($value instanceof Promise) {
+                    $value = yield $value;
+                }
 
-            try {
-                while (true) {
-                    $chunk = yield $stream->read();
-                    if ($chunk === null) {
-                        break;
+                if ($value instanceof CacheItem) {
+                    $value = $value->getResult();
+                }
+
+                if ($value instanceof Iterator) {
+                    while (true === yield $value->advance()) {
+                        if ($value->getCurrent() === null) {
+                            continue;
+                        }
+
+                        yield $fh->write($value->getCurrent());
                     }
+                } elseif ($value instanceof InputStream) {
+                    while (true) {
+                        /** @var string|null $chunk */
+                        $chunk = yield $value->read();
+                        if ($chunk === null) {
+                            break;
+                        }
 
-                    yield $fh->write($chunk);
+                        yield $fh->write($chunk);
+                    }
+                } else {
+                    yield $fh->write($value);
                 }
             } finally {
                 $fh->close();
