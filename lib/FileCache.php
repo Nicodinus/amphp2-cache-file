@@ -89,6 +89,23 @@ class FileCache implements Cache
     /**
      * @inheritDoc
      */
+    public function exist(string $key): Promise
+    {
+        return call(function () use (&$key) {
+            /** @var File\File|null $fh */
+            $fh = yield $this->_get($key);
+            if (!$fh) {
+                return false;
+            }
+
+            $fh->close();
+            return true;
+        });
+    }
+
+    /**
+     * @inheritDoc
+     */
     public function get(string $key): Promise
     {
         return call(function () use (&$key) {
