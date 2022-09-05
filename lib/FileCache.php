@@ -2,14 +2,18 @@
 
 namespace Amp\Cache;
 
-use Amp\ByteStream;
+use Amp\ByteStream\InputStream;
+use Amp\Cache\Internal\PromiseReaderStream;
+use Amp\Emitter;
 use Amp\Failure;
 use Amp\File;
+use Amp\Iterator;
 use Amp\Loop;
 use Amp\Promise;
 use Amp\Sync\KeyedMutex;
 use Amp\Sync\LocalKeyedMutex;
 use Amp\Sync\Lock;
+use function Amp\asyncCall;
 use function Amp\call;
 
 class FileCache implements Cache
@@ -19,6 +23,8 @@ class FileCache implements Cache
     const TTL_TYPE_UINT16_ME = 0x02;
     const TTL_TYPE_UINT32_ME = 0x03;
     const TTL_TYPE_UINT64_ME = 0x04;
+
+    //
 
     /** @var string */
     private string $directory;
@@ -31,6 +37,8 @@ class FileCache implements Cache
 
     /** @var string|null */
     private ?string $gcWatcher;
+
+    //
 
     /**
      * @param string $directory
@@ -67,6 +75,178 @@ class FileCache implements Cache
     }
 
     /**
+     * @return KeyedMutex
+     */
+    public function getMutex(): KeyedMutex
+    {
+        if (empty($this->mutex)) {
+            $this->mutex = new LocalKeyedMutex();
+        }
+
+        return $this->mutex;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function get(string $key): Promise
+    {
+        return call(function () use (&$key) {
+            /** @var File\File|null $fh */
+            $fh = yield $this->_get($key);
+            if (!$fh) {
+                return null;
+            }
+
+            try {
+                $buffer = yield $this->buffer($fh);
+                return $buffer;
+            } finally {
+                $fh->close();
+            }
+        });
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getIterator(string $key): Iterator
+    {
+        $emitter = new Emitter();
+
+        asyncCall(function () use (&$key, &$emitter) {
+            try {
+                /** @var File\File|null $fh */
+                $fh = yield $this->_get($key);
+                if (!$fh) {
+                    $emitter->complete();
+                    return;
+                }
+
+                while (true) {
+                    $chunk = yield $fh->read();
+                    if ($chunk === null) {
+                        break;
+                    }
+
+                    yield $emitter->emit($chunk);
+                }
+
+                $emitter->complete();
+            } catch (\Throwable $exception) {
+                $emitter->fail($exception);
+            }
+        });
+
+        return $emitter->iterate();
+    }
+
+    /**
+     * @inheritDoc
+     *
+     * @psalm-suppress InvalidReturnStatement
+     * @psalm-suppress InvalidReturnType
+     */
+    public function getStream(string $key): InputStream
+    {
+        return new PromiseReaderStream($this->_get($key));
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function set(string $key, $value, int $ttl = null): Promise
+    {
+        if ($value === null) {
+            throw new CacheException('Cannot store NULL in ' . self::class);
+        }
+
+        if (!\is_string($value)) {
+            throw new CacheException('Cannot store non-string value in ' . self::class);
+        }
+
+        return call(function () use (&$key, &$value, &$ttl) {
+            /** @var File\File $fh */
+            $fh = yield $this->_set($key, $ttl);
+
+            try {
+                yield $fh->write($value);
+            } finally {
+                $fh->close();
+            }
+        });
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function setIterator(string $key, Iterator $iterator, int $ttl = null): Promise
+    {
+        return call(function () use (&$key, &$iterator, &$ttl) {
+            /** @var File\File $fh */
+            $fh = yield $this->_set($key, $ttl);
+
+            try {
+                while (true === yield $iterator->advance()) {
+                    yield $fh->write($iterator->getCurrent());
+                }
+            } finally {
+                $fh->close();
+            }
+        });
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function setStream(string $key, InputStream $stream, int $ttl = null): Promise
+    {
+        return call(function () use (&$key, &$stream, &$ttl) {
+            /** @var File\File $fh */
+            $fh = yield $this->_set($key, $ttl);
+
+            try {
+                while (true) {
+                    $chunk = yield $stream->read();
+                    if ($chunk === null) {
+                        break;
+                    }
+
+                    yield $fh->write($chunk);
+                }
+            } finally {
+                $fh->close();
+            }
+        });
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function delete(string $key): Promise
+    {
+        return call(function () use ($key) {
+            $filename = $this->getFilename($key);
+            $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
+
+            if (false === yield $this->filesystem->isFile($path)) {
+                return null;
+            }
+
+            /** @var Lock $lock */
+            $lock = yield $this->getMutex()->acquire($filename);
+
+            try {
+                return yield $this->filesystem->deleteFile($path);
+            } finally {
+                $lock->release();
+            }
+        });
+    }
+
+    //
+
+    /**
      * Calculates filename for cache by $key.
      *
      * @param string $key
@@ -84,6 +264,34 @@ class FileCache implements Cache
     protected function getFileSignature(): ?string
     {
         return 'amp2-cache-file';
+    }
+
+    /**
+     * @param InputStream $stream
+     *
+     * @return Promise<string|null>
+     */
+    protected function buffer(InputStream $stream): Promise
+    {
+        return call(function () use (&$stream) {
+            $buffer = null;
+
+            while (true) {
+                /** @var string|null $chunk */
+                $chunk = yield $stream->read();
+                if ($chunk === null) {
+                    break;
+                }
+
+                if ($buffer === null) {
+                    $buffer = $chunk;
+                } else {
+                    $buffer .= $chunk;
+                }
+            }
+
+            return $buffer;
+        });
     }
 
     /**
@@ -122,18 +330,6 @@ class FileCache implements Cache
         } catch (\Throwable $e) {
             // ignore
         }
-    }
-
-    /**
-     * @return KeyedMutex
-     */
-    public function getMutex(): KeyedMutex
-    {
-        if (empty($this->mutex)) {
-            $this->mutex = new LocalKeyedMutex();
-        }
-
-        return $this->mutex;
     }
 
     /**
@@ -223,10 +419,16 @@ class FileCache implements Cache
         });
     }
 
-    /** @inheritdoc */
-    public function get(string $key): Promise
+    /**
+     * @param string $key
+     *
+     * @return Promise<File\File|null>
+     *
+     * @see FileCache::get()
+     */
+    protected function _get(string $key): Promise
     {
-        return call(function () use ($key) {
+        return call(function () use (&$key) {
             $filename = $this->getFilename($key);
             $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
 
@@ -244,13 +446,12 @@ class FileCache implements Cache
                     return null;
                 }
 
-                $buffer = yield ByteStream\buffer($fh);
-                if (\strlen($buffer) < 1) {
-                    yield $fh->close();
+                if ((yield $this->filesystem->getSize($path)) < 1) {
                     yield $this->filesystem->deleteFile($path);
                     return null;
                 }
-                return $buffer;
+
+                return $fh;
             } catch (\Throwable $exception) {
                 if (true === yield $this->filesystem->isFile($path)) {
                     yield $this->filesystem->deleteFile($path);
@@ -262,22 +463,23 @@ class FileCache implements Cache
         });
     }
 
-    /** @inheritdoc */
-    public function set(string $key, $value, int $ttl = null): Promise
+    /**
+     * @param string $key
+     * @param int|null $ttl
+     *
+     * @return Promise<File\File>
+     *
+     * @throws CacheException
+     *
+     * @see FileCache::set()
+     */
+    protected function _set(string $key, int $ttl = null): Promise
     {
-        if ($value === null) {
-            throw new CacheException('Cannot store NULL in ' . self::class);
-        }
-
-        if (!\is_string($value)) {
-            throw new CacheException('Cannot store non-string value in ' . self::class);
-        }
-
         if ($ttl < 0) {
-            throw new \Error("Invalid cache TTL ({$ttl}); integer >= 0 or null required");
+            throw new CacheException("Invalid cache TTL ({$ttl}); integer >= 0 or null required");
         }
 
-        return call(function () use ($key, $value, $ttl) {
+        return call(function () use (&$key, &$ttl) {
             $filename = $this->getFilename($key);
             $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
 
@@ -310,29 +512,10 @@ class FileCache implements Cache
             }
 
             try {
-                yield $this->filesystem->write($path, $expiredAt . $value);
-            } finally {
-                $lock->release();
-            }
-        });
-    }
-
-    /** @inheritdoc */
-    public function delete(string $key): Promise
-    {
-        return call(function () use ($key) {
-            $filename = $this->getFilename($key);
-            $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
-
-            if (false === yield $this->filesystem->isFile($path)) {
-                return null;
-            }
-
-            /** @var Lock $lock */
-            $lock = yield $this->getMutex()->acquire($filename);
-
-            try {
-                return yield $this->filesystem->deleteFile($path);
+                /** @var File\File $fh */
+                $fh = yield $this->filesystem->openFile($path, 'wb');
+                yield $fh->write($expiredAt);
+                return $fh;
             } finally {
                 $lock->release();
             }
