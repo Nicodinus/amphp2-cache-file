@@ -2,8 +2,7 @@
 
 namespace Amp\Cache;
 
-use Amp\ByteStream\InputStream;
-use Amp\Coroutine;
+use Amp\ByteStream;
 use Amp\Failure;
 use Amp\File;
 use Amp\Iterator;
@@ -21,6 +20,9 @@ class FileCache implements Cache
     const TTL_TYPE_UINT16_ME = 0x02;
     const TTL_TYPE_UINT32_ME = 0x03;
     const TTL_TYPE_UINT64_ME = 0x04;
+
+    const DATA_TYPE_STRING = 0x00;
+    const DATA_TYPE_STREAM = 0x01;
 
     //
 
@@ -90,14 +92,28 @@ class FileCache implements Cache
     public function exist(string $key): Promise
     {
         return call(function () use (&$key) {
-            /** @var File\File|null $fh */
-            $fh = yield $this->_get($key);
-            if (!$fh) {
-                return false;
-            }
+            $filename = $this->getFilename($key);
+            $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
 
-            $fh->close();
-            return true;
+            /** @var Lock $lock */
+            $lock = yield $this->getMutex()->acquire($filename);
+
+            try {
+                if (false === yield $this->filesystem->isFile($path)) {
+                    return false;
+                }
+
+                /** @var File\File|null $fh */
+                $fh = yield $this->openCacheFileAtPath($path);
+                if (!$fh) {
+                    return false;
+                }
+
+                $fh->close();
+                return true;
+            } finally {
+                $lock->release();
+            }
         });
     }
 
@@ -106,36 +122,7 @@ class FileCache implements Cache
      */
     public function get(string $key): Promise
     {
-        return call(function () use (&$key) {
-            /** @var File\File|null $fh */
-            $fh = yield $this->_get($key);
-            if (!$fh) {
-                return null;
-            }
-
-            try {
-                $buffer = yield $this->buffer($fh);
-                return $buffer;
-            } finally {
-                $fh->close();
-            }
-        });
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function getItem(string $key): Promise
-    {
-        return call(function () use (&$key) {
-            /** @var File\File|null $fh */
-            $fh = yield $this->_get($key);
-            if (!$fh) {
-                return null;
-            }
-
-            return new CacheItem($fh);
-        });
+        return $this->_get($key);
     }
 
     /**
@@ -147,50 +134,7 @@ class FileCache implements Cache
             throw new CacheException('Cannot store NULL in ' . self::class);
         }
 
-        return call(function () use (&$key, &$value, &$ttl) {
-            /** @var File\File $fh */
-            $fh = yield $this->_set($key, $ttl);
-
-            try {
-                if (\is_callable($value)) {
-                    $value = call($value);
-                } elseif ($value instanceof \Generator) {
-                    $value = new Coroutine($value);
-                }
-
-                if ($value instanceof Promise) {
-                    $value = yield $value;
-                }
-
-                if ($value instanceof CacheItem) {
-                    $value = $value->getResult();
-                }
-
-                if ($value instanceof Iterator) {
-                    while (true === yield $value->advance()) {
-                        if ($value->getCurrent() === null) {
-                            continue;
-                        }
-
-                        yield $fh->write($value->getCurrent());
-                    }
-                } elseif ($value instanceof InputStream) {
-                    while (true) {
-                        /** @var string|null $chunk */
-                        $chunk = yield $value->read();
-                        if ($chunk === null) {
-                            break;
-                        }
-
-                        yield $fh->write($chunk);
-                    }
-                } else {
-                    yield $fh->write($value);
-                }
-            } finally {
-                $fh->close();
-            }
-        });
+        return $this->_set($key, $value, $ttl);
     }
 
     /**
@@ -240,11 +184,11 @@ class FileCache implements Cache
     }
 
     /**
-     * @param InputStream $stream
+     * @param ByteStream\InputStream $stream
      *
      * @return Promise<string|null>
      */
-    protected function buffer(InputStream $stream): Promise
+    protected function buffer(ByteStream\InputStream $stream): Promise
     {
         return call(function () use (&$stream) {
             $buffer = null;
@@ -395,7 +339,7 @@ class FileCache implements Cache
     /**
      * @param string $key
      *
-     * @return Promise<File\File|null>
+     * @return Promise<mixed|null>
      *
      * @see FileCache::get()
      */
@@ -405,90 +349,198 @@ class FileCache implements Cache
             $filename = $this->getFilename($key);
             $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
 
-            if (false === yield $this->filesystem->isFile($path)) {
-                return null;
-            }
-
             /** @var Lock $lock */
             $lock = yield $this->getMutex()->acquire($filename);
+            $canReleaseLock = true;
+
+            /** @var File\File|null $fh */
+            $fh = null;
+            $canCloseFile = true;
 
             try {
-                /** @var File\File|null $fh */
+                if (false === yield $this->filesystem->isFile($path)) {
+                    return null;
+                }
+
                 $fh = yield $this->openCacheFileAtPath($path);
                 if (!$fh) {
                     return null;
                 }
 
-                if ((yield $this->filesystem->getSize($path)) < 1) {
-                    yield $this->filesystem->deleteFile($path);
-                    return null;
+                $dataType = yield $fh->read(1);
+                if ($dataType === null) {
+                    throw new CacheException("Invalid cache file (data_type empty) at `{$path}`");
+                }
+                $dataType = \unpack('C', $dataType)[1];
+
+                if ($dataType === self::DATA_TYPE_STREAM) {
+                    $chunk = yield $fh->read();
+                    if ($chunk === null) {
+                        throw new CacheException("Invalid cache file (data empty) at `{$path}`");
+                    }
+
+                    $canReleaseLock = false;
+                    $canCloseFile = false;
+
+                    $reader = new class implements ByteStream\InputStream {
+                        /** @var File\File|null */
+                        public ?File\File $fh = null;
+
+                        /** @var Lock|null */
+                        public ?Lock $lock = null;
+
+                        /** @var string|null */
+                        public ?string $append = null;
+
+                        //
+
+                        /**
+                         * @inheritDoc
+                         */
+                        public function read(): Promise
+                        {
+                            return call(function () {
+                                if (!$this->fh) {
+                                    return null;
+                                }
+
+                                if ($this->append) {
+                                    $data = $this->append;
+                                    $this->append = null;
+                                    return $data;
+                                }
+
+                                $data = yield $this->fh->read();
+                                if ($data === null) {
+                                    $this->fh->close();
+                                    $this->fh = null;
+
+                                    if ($this->lock) {
+                                        $this->lock->release();
+                                        $this->lock = null;
+                                    }
+                                }
+
+                                return $data;
+                            });
+                        }
+                    };
+
+                    $reader->fh = &$fh;
+                    $reader->lock = &$lock;
+                    $reader->append = $chunk;
+
+                    return $reader;
                 }
 
-                return $fh;
+                $result = yield $this->buffer($fh);
+                if ($result === null) {
+                    throw new CacheException("Invalid cache file (data empty) at `{$path}`");
+                }
+                return $result;
             } catch (\Throwable $exception) {
+                if ($fh && $canCloseFile) {
+                    yield $fh->close();
+                    $fh = null;
+                }
+
                 if (true === yield $this->filesystem->isFile($path)) {
                     yield $this->filesystem->deleteFile($path);
                 }
+
                 return null;
             } finally {
-                $lock->release();
+                /** @psalm-suppress RedundantCondition */
+                if ($lock && $canReleaseLock) {
+                    $lock->release();
+                    $lock = null;
+                }
+
+                /** @psalm-suppress RedundantCondition */
+                if ($fh && $canCloseFile) {
+                    yield $fh->close();
+                    $fh = null;
+                }
             }
         });
     }
 
     /**
      * @param string $key
+     * @param mixed $value
      * @param int|null $ttl
      *
-     * @return Promise<File\File>
-     *
-     * @throws CacheException
+     * @return Promise<void>
      *
      * @see FileCache::set()
      */
-    protected function _set(string $key, int $ttl = null): Promise
+    protected function _set(string $key, $value, int $ttl = null): Promise
     {
         if ($ttl < 0) {
-            throw new CacheException("Invalid cache TTL ({$ttl}); integer >= 0 or null required");
+            $ttl = null;
         }
 
-        return call(function () use (&$key, &$ttl) {
+        return call(function () use (&$key, &$value, &$ttl) {
             $filename = $this->getFilename($key);
             $path = $this->directory . DIRECTORY_SEPARATOR . $filename;
-
-            if (false === yield $this->filesystem->isDirectory($this->directory)) {
-                yield $this->filesystem->createDirectoryRecursively($this->directory, 0700);
-            }
 
             /** @var Lock $lock */
             $lock = yield $this->getMutex()->acquire($filename);
 
-            if ($ttl === null) {
-                $expiredAt = \pack('C', self::TTL_TYPE_NONE);
-            } else {
-                $ttl = \hrtime(true) + $ttl * 1e+9;
-                if ($ttl <= 0xFF) {
-                    $expiredAt = \pack('CC', self::TTL_TYPE_UINT8_ME, $ttl);
-                } elseif ($ttl > 0xFF && $ttl <= 0xFFFF) {
-                    $expiredAt = \pack('CS', self::TTL_TYPE_UINT16_ME, $ttl);
-                } elseif ($ttl > 0xFFFF && $ttl <= 0xFFFFFFFF) {
-                    $expiredAt = \pack('CL', self::TTL_TYPE_UINT32_ME, $ttl);
-                } else {
-                    $expiredAt = \pack('CQ', self::TTL_TYPE_UINT64_ME, $ttl);
-                }
-            }
-
-            $checkSignature = $this->getFileSignature();
-            $checkSignatureLength = $checkSignature !== null ? \strlen($checkSignature) : 0;
-            if ($checkSignatureLength > 0) {
-                $expiredAt = $this->getFileSignature() . $expiredAt;
-            }
-
             try {
+                if (false === yield $this->filesystem->isDirectory($this->directory)) {
+                    yield $this->filesystem->createDirectoryRecursively($this->directory, 0700);
+                }
+
+                if ($ttl === null) {
+                    $expiredAtRawString = \pack('C', self::TTL_TYPE_NONE);
+                } else {
+                    $ttl = \hrtime(true) + $ttl * 1e+9;
+                    if ($ttl <= 0xFF) {
+                        $expiredAtRawString = \pack('CC', self::TTL_TYPE_UINT8_ME, $ttl);
+                    } elseif ($ttl > 0xFF && $ttl <= 0xFFFF) {
+                        $expiredAtRawString = \pack('CS', self::TTL_TYPE_UINT16_ME, $ttl);
+                    } elseif ($ttl > 0xFFFF && $ttl <= 0xFFFFFFFF) {
+                        $expiredAtRawString = \pack('CL', self::TTL_TYPE_UINT32_ME, $ttl);
+                    } else {
+                        $expiredAtRawString = \pack('CQ', self::TTL_TYPE_UINT64_ME, $ttl);
+                    }
+                }
+
+                $checkSignature = $this->getFileSignature();
+                $checkSignatureLength = $checkSignature !== null ? \strlen($checkSignature) : 0;
+                if ($checkSignatureLength > 0) {
+                    $expiredAtRawString = $this->getFileSignature() . $expiredAtRawString;
+                }
+
+                $dataType = self::DATA_TYPE_STRING;
+                if ($value instanceof Iterator) {
+                    $dataType = self::DATA_TYPE_STREAM;
+                } elseif ($value instanceof ByteStream\InputStream) {
+                    $dataType = self::DATA_TYPE_STREAM;
+                }
+                $dataTypeRawString = \pack('C', $dataType);
+
                 /** @var File\File $fh */
                 $fh = yield $this->filesystem->openFile($path, 'wb');
-                yield $fh->write($expiredAt);
-                return $fh;
+
+                try {
+                    yield $fh->write($expiredAtRawString . $dataTypeRawString);
+
+                    if ($value instanceof Iterator) {
+                        while (true === yield $value->advance()) {
+                            yield $fh->write($value->getCurrent());
+                        }
+                    } elseif ($value instanceof ByteStream\InputStream) {
+                        while (($chunk = yield $value->read()) !== null) {
+                            yield $fh->write($chunk);
+                        }
+                    } else {
+                        yield $fh->write($value);
+                    }
+                } finally {
+                    $fh->close();
+                }
             } finally {
                 $lock->release();
             }
